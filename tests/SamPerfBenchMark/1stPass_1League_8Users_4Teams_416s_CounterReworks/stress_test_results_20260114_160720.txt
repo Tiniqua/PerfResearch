@@ -1,0 +1,30 @@
+STRESS TEST RESULTS - 20260114_160720
+============================================================
+
+VERDICT: READY FOR PILOT
+
+CONFIG:
+  Leagues: 1
+  Users per league: 8
+  Teams per roster: 4
+  Target: http://127.0.0.1:8001/api
+
+SUMMARY:
+  Duration: 416.1s
+  Leagues completed: 1/1
+  Total bids: 32 (32 success, 0 failed)
+  Lots sold: 32
+
+LATENCY:
+  p50: 7.006406784057617ms
+  p95: 8.00776481628418ms
+  p99: 8.008003234863281ms
+  max: 8.008003234863281ms
+
+PASSED:
+  [OK] All leagues completed successfully
+  [OK] Bid latency excellent (p99=8ms)
+  [OK] Socket.IO events flowing (31 received)
+  [OK] Bid success rate healthy (100.0%)
+  [OK] Auction lots selling (32/32 sold)
+

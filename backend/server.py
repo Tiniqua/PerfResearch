@@ -20,6 +20,110 @@ from datetime import datetime, timedelta, timezone
 import time
 from contextlib import asynccontextmanager
 
+# ===== IN-MEMORY LOT TIMER (NO DB POLLING) =====
+from dataclasses import dataclass
+from typing import Dict, Optional
+import asyncio
+from datetime import datetime, timezone
+
+@dataclass
+class LotTimerState:
+    auction_id: str
+    lot_id: str
+    ends_at_ms: int
+    seq: int = 0  # local monotonic counter for logging/debug
+
+
+# auction_id -> state/task
+LOT_TIMER_STATE: Dict[str, LotTimerState] = {}
+LOT_TIMER_TASKS: Dict[str, asyncio.Task] = {}
+LOT_TIMER_SEQ: int = 0
+
+
+def _now_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+
+def cancel_lot_timer(auction_id: str) -> None:
+    """Cancel any running timer for this auction."""
+    task = LOT_TIMER_TASKS.get(auction_id)
+    if task and not task.done():
+        task.cancel()
+    LOT_TIMER_TASKS.pop(auction_id, None)
+    LOT_TIMER_STATE.pop(auction_id, None)
+
+
+async def _run_lot_timer(auction_id: str, expected_lot_id: str, expected_ends_at_ms: int) -> None:
+    """
+    Sleep-until-end timer (no DB polling).
+    Will only complete the lot if the state still matches (lot_id + ends_at_ms).
+    """
+    try:
+        delay_s = max(0.0, (expected_ends_at_ms - _now_ms()) / 1000.0)
+        await asyncio.sleep(delay_s)
+
+        # Verify timer still current (not superseded by a new lot or anti-snipe)
+        state = LOT_TIMER_STATE.get(auction_id)
+        if not state:
+            return
+        if state.lot_id != expected_lot_id or state.ends_at_ms != expected_ends_at_ms:
+            return  # superseded
+
+        logger.info(f"[timer] Expired: auction={auction_id} lot={expected_lot_id} ends_at_ms={expected_ends_at_ms}")
+        await complete_lot(auction_id)
+
+    except asyncio.CancelledError:
+        # Normal path when timer is updated (anti-snipe / next lot)
+        return
+    except Exception as e:
+        logger.exception(f"[timer] Error in lot timer: auction={auction_id} err={e}")
+    finally:
+        # Only cleanup if we still own the task/state
+        st = LOT_TIMER_STATE.get(auction_id)
+        if st and st.lot_id == expected_lot_id and st.ends_at_ms == expected_ends_at_ms:
+            LOT_TIMER_TASKS.pop(auction_id, None)
+            LOT_TIMER_STATE.pop(auction_id, None)
+
+
+async def start_or_update_lot_timer(
+        auction_id: str,
+        lot_id: str,
+        ends_at_ms: int,
+        *,
+        emit_tick: bool = True,
+) -> None:
+    """
+    Start or reschedule the in-memory timer.
+
+    - No DB reads.
+    - Cancels previous timer task.
+    - Optionally emits a single 'tick' update for clients to sync.
+    """
+    global LOT_TIMER_SEQ
+    LOT_TIMER_SEQ += 1
+
+    # Cancel previous
+    prev = LOT_TIMER_TASKS.get(auction_id)
+    if prev and not prev.done():
+        prev.cancel()
+
+    state = LotTimerState(auction_id=auction_id, lot_id=lot_id, ends_at_ms=ends_at_ms, seq=LOT_TIMER_SEQ)
+    LOT_TIMER_STATE[auction_id] = state
+
+    # Emit ONE tick update (clients should run local countdown)
+    if emit_tick:
+        try:
+            timer_data = create_timer_event(lot_id, ends_at_ms)
+            metrics.increment_timer_tick(auction_id)  # keep your metric if you want
+            await sio.emit("tick", timer_data, room=f"auction:{auction_id}")
+        except Exception as e:
+            logger.warning(f"[timer] Failed to emit tick update: auction={auction_id} lot={lot_id} err={e}")
+
+    # Start new task
+    task = asyncio.create_task(_run_lot_timer(auction_id, lot_id, ends_at_ms))
+    LOT_TIMER_TASKS[auction_id] = task
+
+
 # Production hardening imports
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from fastapi_limiter import FastAPILimiter
@@ -4402,7 +4506,8 @@ async def start_auction(league_id: str):
             }, room=f"auction:{auction_obj.id}")
             
             # Start timer countdown
-            asyncio.create_task(countdown_timer(auction_obj.id, timer_end, lot_id))
+            ends_at_ms = int(timer_end.replace(tzinfo=timezone.utc).timestamp() * 1000) if timer_end.tzinfo is None else int(timer_end.timestamp() * 1000)
+            await start_or_update_lot_timer(auction_obj.id, lot_id, ends_at_ms, emit_tick=True)
             
             logger.info(f"Created and started auction {auction_obj.id} immediately (legacy mode) with {len(asset_queue)} assets")
         else:
@@ -4546,7 +4651,8 @@ async def begin_auction(
     })
     
     # Start timer countdown
-    asyncio.create_task(countdown_timer(auction_id, timer_end, lot_id))
+    ends_at_ms = int(timer_end.replace(tzinfo=timezone.utc).timestamp() * 1000) if timer_end.tzinfo is None else int(timer_end.timestamp() * 1000)
+    await start_or_update_lot_timer(auction_id, lot_id, ends_at_ms, emit_tick=True)
     
     logger.info(f"Commissioner started auction {auction_id}, first lot: {first_asset.get('name')}")
     
@@ -4912,6 +5018,7 @@ async def place_bid(auction_id: str, bid_input: BidCreate):
             if lot_id:
                 ends_at_ms = int(new_end_time.timestamp() * 1000)
                 timer_data = create_timer_event(lot_id, ends_at_ms)
+                await start_or_update_lot_timer(auction_id, lot_id, ends_at_ms, emit_tick=True)
                 
                 await sio.emit('anti_snipe', timer_data, room=f"auction:{auction_id}")
                 
@@ -5018,7 +5125,8 @@ async def start_lot(auction_id: str, club_id: str):
     logger.info(f"Manual start lot {lot_id}: {club['name']}, seq={timer_data['seq']}")
     
     # Start timer countdown
-    asyncio.create_task(countdown_timer(auction_id, timer_end, lot_id))
+    ends_at_ms = int(timer_end.replace(tzinfo=timezone.utc).timestamp() * 1000) if timer_end.tzinfo is None else int(timer_end.timestamp() * 1000)
+    await start_or_update_lot_timer(auction_id, lot_id, ends_at_ms, emit_tick=True)
     
     return {"message": "Lot started", "club": Club(**club)}
 
@@ -5320,7 +5428,8 @@ async def start_next_lot(auction_id: str, next_club_id: str):
     logger.info(f"Started lot {next_lot_number}: {next_club['name']}")
     
     # Start timer countdown
-    asyncio.create_task(countdown_timer(auction_id, timer_end, next_lot_id))
+    ends_at_ms = int(timer_end.replace(tzinfo=timezone.utc).timestamp() * 1000) if timer_end.tzinfo is None else int(timer_end.timestamp() * 1000)
+    await start_or_update_lot_timer(auction_id, next_lot_id, ends_at_ms, emit_tick=True)
 
 
 async def check_auction_completion(auction_id: str, final_club_id: str = None, final_winning_bid: dict = None):
@@ -5662,8 +5771,14 @@ async def resume_auction(auction_id: str, commissioner_id: str = None):
     current_lot_id = auction.get("currentLotId")
     if not current_lot_id:
         current_lot_id = f"{auction_id}-lot-{auction.get('currentLot', 1)}"
-    
-    asyncio.create_task(countdown_timer(auction_id, new_end_time, current_lot_id))
+
+    ends_at_ms = int(new_end_time.timestamp() * 1000)
+    await start_or_update_lot_timer(
+        auction_id=auction_id,
+        lot_id=current_lot_id,
+        ends_at_ms=ends_at_ms,
+        emit_tick=True
+    )
     
     # Notify all participants
     await sio.emit('auction_resumed', {
@@ -5746,81 +5861,14 @@ async def delete_auction(auction_id: str, commissioner_id: str = None):
 
 # ===== TIMER COUNTDOWN =====
 async def countdown_timer(auction_id: str, end_time: datetime, lot_id: str):
-    """Countdown timer with standardized events"""
-    
-    # Store this timer to prevent duplicates
-    if auction_id in active_timers:
-        # Cancel existing timer
-        active_timers[auction_id].cancel()
-    
-    # Create current task handle
-    current_task = asyncio.current_task()
-    active_timers[auction_id] = current_task
-    
-    try:
-        logger.info(f"Starting countdown timer for auction {auction_id}, lot {lot_id}")
-        
-        # Convert end_time to epoch milliseconds
-        if end_time.tzinfo is None:
-            end_time = end_time.replace(tzinfo=timezone.utc)
-        ends_at_ms = int(end_time.timestamp() * 1000)
-        
-        while True:
-            await asyncio.sleep(0.5)  # 500ms tick interval
-            
-            # Check if we should stop (cancelled or auction ended)
-            if auction_id not in active_timers or active_timers[auction_id] != current_task:
-                logger.info(f"Timer for auction {auction_id} was cancelled")
-                break
-            
-            # Check if auction still exists and is active
-            auction = await db.auctions.find_one({"id": auction_id}, {"_id": 0})
-            if not auction or auction["status"] != "active":
-                logger.info(f"Auction {auction_id} no longer active, stopping timer")
-                break
-            
-            # Get updated end time (in case of anti-snipe)
-            current_end_time = auction.get("timerEndsAt")
-            if not current_end_time:
-                logger.info(f"No timer end time for auction {auction_id}, stopping timer")
-                break
-            
-            # Update ends_at_ms if it changed (anti-snipe)
-            if current_end_time.tzinfo is None:
-                current_end_time = current_end_time.replace(tzinfo=timezone.utc)
-            new_ends_at_ms = int(current_end_time.timestamp() * 1000)
-            
-            if new_ends_at_ms != ends_at_ms:
-                # Anti-snipe occurred, update end time
-                ends_at_ms = new_ends_at_ms
-                logger.info(f"Anti-snipe detected for auction {auction_id}, new end time: {ends_at_ms}")
-            
-            # Check if timer expired
-            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-            if now_ms >= ends_at_ms:
-                # Timer expired, complete the lot
-                logger.info(f"Timer expired for auction {auction_id}, completing lot")
-                await complete_lot(auction_id)
-                break
-            
-            # Emit timer tick
-            timer_data = create_timer_event(lot_id, ends_at_ms)
-            logger.debug(f"Emitting tick for lot {lot_id}: seq={timer_data['seq']}")
-            
-            # Metrics: Track timer ticks
-            metrics.increment_timer_tick(auction_id)
-            
-            await sio.emit('tick', timer_data, room=f"auction:{auction_id}")  # Broadcast to auction room only
-    
-    except asyncio.CancelledError:
-        logger.info(f"Timer for auction {auction_id} was cancelled")
-    except Exception as e:
-        logger.error(f"Timer error for auction {auction_id}: {str(e)}")
-    finally:
-        # Clean up timer reference
-        if auction_id in active_timers and active_timers[auction_id] == current_task:
-            del active_timers[auction_id]
-        logger.info(f"Timer cleanup completed for auction {auction_id}")
+    """
+    Compatibility wrapper. Old code used countdown_timer(create_task(...)).
+    New code uses start_or_update_lot_timer(...) which does not poll MongoDB.
+    """
+    if end_time.tzinfo is None:
+        end_time = end_time.replace(tzinfo=timezone.utc)
+    ends_at_ms = int(end_time.timestamp() * 1000)
+    await start_or_update_lot_timer(auction_id, lot_id, ends_at_ms, emit_tick=True)
 
 # ===== SOCKET.IO EVENTS =====
 @sio.event
