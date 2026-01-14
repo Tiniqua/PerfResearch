@@ -1,0 +1,32 @@
+STRESS TEST RESULTS - 20260114_145130
+============================================================
+
+VERDICT: PROCEED WITH CAUTION - Review warnings
+
+CONFIG:
+  Leagues: 1
+  Users per league: 2
+  Teams per roster: 2
+  Target: http://localhost:8001/api
+
+SUMMARY:
+  Duration: 55.1s
+  Leagues completed: 1/1
+  Total bids: 4 (4 success, 0 failed)
+  Lots sold: 4
+
+LATENCY:
+  p50: 250.2274513244629ms
+  p95: 261.23738288879395ms
+  p99: 261.23738288879395ms
+  max: 261.23738288879395ms
+
+PASSED:
+  [OK] All leagues completed successfully
+  [OK] Socket.IO events flowing (3 received)
+  [OK] Bid success rate healthy (100.0%)
+  [OK] Auction lots selling (4/4 sold)
+
+WARNINGS:
+  [WARN] Bid latency acceptable but monitor (p99=261ms)
+

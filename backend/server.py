@@ -6614,6 +6614,7 @@ socket_app = socketio.ASGIApp(
     other_asgi_app=app,
     socketio_path='api/socket.io'
 )
+application = socket_app
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
