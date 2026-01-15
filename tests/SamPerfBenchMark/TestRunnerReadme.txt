@@ -11,3 +11,5 @@ cd C:\Users\samua\Desktop\Daz\joeyjones\tests
 python multi_league_stress_test.py --leagues 1 --users 2 --teams 2 --url http://localhost:8001
 python multi_league_stress_test.py --leagues 1 --users 8 --teams 4 --url http://127.0.0.1:8001
 
+
+python multi_league_stress_test.py --leagues 1 --users 2 --teams 2 --url https://draft-kings-mobile.emergent.host
